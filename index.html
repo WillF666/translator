@@ -101,6 +101,20 @@
       background: var(--danger-soft);
     }
     .status-chip.error .dot { background: var(--danger); }
+    .status-chip.speaking {
+      color: var(--accent);
+      border-color: rgba(74, 163, 255, 0.4);
+      background: var(--accent-soft);
+    }
+    .status-chip.speaking .dot { background: var(--accent); }
+    .version {
+      font-size: 11px;
+      color: var(--faint);
+      font-weight: 500;
+      letter-spacing: 0.06em;
+      margin-left: 8px;
+      vertical-align: middle;
+    }
     @keyframes pulse {
       0% { box-shadow: 0 0 0 0 rgba(62, 207, 142, 0.7); }
       100% { box-shadow: 0 0 0 10px rgba(62, 207, 142, 0); }
@@ -356,7 +370,7 @@
   <div class="app">
     <header>
       <div class="brand">
-        <h1>实时同传翻译</h1>
+        <h1>实时同传翻译 <span class="version">v1.1</span></h1>
         <p>对着麦克风说话，译文会边说边出来</p>
       </div>
       <div id="statusChip" class="status-chip" aria-live="polite">
@@ -389,7 +403,7 @@
         <button type="button" class="btn" id="copyBtn">复制译文</button>
         <button type="button" class="btn" id="exportBtn">导出记录</button>
         <label class="toggle">
-          <input type="checkbox" id="speakToggle" />
+          <input type="checkbox" id="speakToggle" checked />
           朗读译文
         </label>
       </div>
@@ -419,7 +433,7 @@
     </section>
 
     <footer>
-      语音识别由浏览器提供（Chrome 会将音频发送至 Google）。翻译使用公开接口，无需密钥。本页不会把内容保存到服务器。
+      v1.1 · 语音识别由浏览器提供（Chrome 会将音频发送至 Google）。翻译使用公开接口，无需密钥。本页不会把内容保存到服务器。
     </footer>
   </div>
 
@@ -480,6 +494,12 @@
       var lines = [];
       var skippedEngines = {};
       var activeEngineName = "";
+      var SPEAK_KEY = "tongchuan-speak";
+      var ttsQueue = [];
+      var speaking = false;
+      var pausedForTts = false;
+      var speakGen = 0;
+      var currentUtter = null;
 
       var ENGINES = [
         {
@@ -569,7 +589,7 @@
       }
 
       function setStatus(mode, text) {
-        statusChip.classList.remove("listening", "error");
+        statusChip.classList.remove("listening", "error", "speaking");
         if (mode) statusChip.classList.add(mode);
         statusText.textContent = text;
       }
@@ -654,18 +674,150 @@
         });
       }
 
-      function speak(text) {
+      function pickVoice(lang) {
+        if (!window.speechSynthesis) return null;
+        var voices = window.speechSynthesis.getVoices() || [];
+        if (!voices.length) return null;
+        var want = (lang || "").toLowerCase().replace(/_/g, "-");
+        var prefix = want.slice(0, 2);
+        var best = null;
+        var bestScore = -1;
+        var i, v, vl, score;
+        for (i = 0; i < voices.length; i++) {
+          v = voices[i];
+          vl = (v.lang || "").toLowerCase().replace(/_/g, "-");
+          score = -1;
+          if (vl === want) score = 3;
+          else if (vl.indexOf(want + "-") === 0 || vl.indexOf(want) === 0) score = 2;
+          else if (vl.slice(0, 2) === prefix) score = 1;
+          if (score > 0 && v.localService) score += 0.2;
+          if (score > 0 && v.default) score += 0.1;
+          if (score > bestScore) {
+            bestScore = score;
+            best = v;
+          }
+        }
+        return best;
+      }
+
+      function unlockSpeech() {
+        if (!window.speechSynthesis) return;
+        try {
+          window.speechSynthesis.cancel();
+          var silent = new SpeechSynthesisUtterance(" ");
+          silent.volume = 0;
+          silent.rate = 1;
+          silent.lang = speechCode(targetSel.value);
+          window.speechSynthesis.speak(silent);
+        } catch (e) {}
+      }
+
+      function pauseRecognitionForTts() {
+        if (!running) return;
+        pausedForTts = true;
+        if (restartTimer) {
+          clearTimeout(restartTimer);
+          restartTimer = null;
+        }
+        if (recognition) {
+          try { recognition.stop(); } catch (e) {}
+        }
+      }
+
+      function maybeResumeRecognition() {
+        if (!pausedForTts) return;
+        if (speaking || ttsQueue.length) return;
+        pausedForTts = false;
+        if (!running || !recognition) return;
+        if (restartTimer) clearTimeout(restartTimer);
+        restartTimer = setTimeout(function () {
+          if (!running || !recognition || speaking || ttsQueue.length || pausedForTts) return;
+          try {
+            recognition.lang = speechCode(sourceSel.value);
+            recognition.start();
+            setStatus("listening", "正在聆听");
+          } catch (e) {
+            // Already started, ignore.
+          }
+        }, 300);
+      }
+
+      function flushTts() {
+        ttsQueue = [];
+        speaking = false;
+        speakGen += 1;
+        currentUtter = null;
+        if (window.speechSynthesis) {
+          try { window.speechSynthesis.cancel(); } catch (e) {}
+        }
+      }
+
+      function enqueueSpeak(text) {
         if (!speakToggle.checked || !text || !window.speechSynthesis) return;
+        ttsQueue.push(text);
+        if (!speaking) playNext();
+      }
+
+      function playNext() {
+        if (!speakToggle.checked || !window.speechSynthesis) {
+          ttsQueue = [];
+          speaking = false;
+          maybeResumeRecognition();
+          return;
+        }
+        if (!ttsQueue.length) {
+          speaking = false;
+          maybeResumeRecognition();
+          return;
+        }
+        var text = ttsQueue.shift();
+        var gen = ++speakGen;
+        speaking = true;
+        pauseRecognitionForTts();
+        setStatus("speaking", "正在朗读…");
+
         var utter = new SpeechSynthesisUtterance(text);
+        currentUtter = utter;
         utter.lang = speechCode(targetSel.value);
         utter.rate = 1.05;
-        var voices = window.speechSynthesis.getVoices() || [];
-        var langPrefix = utter.lang.slice(0, 2).toLowerCase();
-        var voice = voices.filter(function (v) {
-          return (v.lang || "").toLowerCase().indexOf(langPrefix) === 0;
-        })[0];
+        var voice = pickVoice(utter.lang);
         if (voice) utter.voice = voice;
-        window.speechSynthesis.speak(utter);
+
+        function done() {
+          if (gen !== speakGen) return;
+          if (currentUtter === utter) currentUtter = null;
+          speaking = false;
+          playNext();
+        }
+        utter.onend = done;
+        utter.onerror = done;
+
+        try { window.speechSynthesis.resume(); } catch (e) {}
+        try {
+          window.speechSynthesis.speak(utter);
+        } catch (e) {
+          done();
+        }
+      }
+
+      function speak(text) {
+        enqueueSpeak(text);
+      }
+
+      function loadSpeakPref() {
+        try {
+          var saved = localStorage.getItem(SPEAK_KEY);
+          if (saved === "0") speakToggle.checked = false;
+          else speakToggle.checked = true;
+        } catch (e) {
+          speakToggle.checked = true;
+        }
+      }
+
+      function saveSpeakPref() {
+        try {
+          localStorage.setItem(SPEAK_KEY, speakToggle.checked ? "1" : "0");
+        } catch (e) {}
       }
 
       function appendPair(src, dst) {
@@ -761,7 +913,6 @@
           return;
         }
         showError("");
-        if (window.speechSynthesis) window.speechSynthesis.cancel();
         running = true;
         toggleBtn.textContent = "停止同传";
         toggleBtn.classList.add("stop");
@@ -821,9 +972,11 @@
 
           recognition.onend = function () {
             if (!running) return;
+            if (pausedForTts || speaking || ttsQueue.length) return;
             if (restartTimer) clearTimeout(restartTimer);
             restartTimer = setTimeout(function () {
               if (!running || !recognition) return;
+              if (pausedForTts || speaking || ttsQueue.length) return;
               try {
                 recognition.lang = speechCode(sourceSel.value);
                 recognition.start();
@@ -866,9 +1019,10 @@
 
       function stopRecognition() {
         running = false;
+        pausedForTts = false;
         if (restartTimer) clearTimeout(restartTimer);
         if (debounceTimer) clearTimeout(debounceTimer);
-        if (window.speechSynthesis) window.speechSynthesis.cancel();
+        flushTts();
         if (recognition) {
           try { recognition.stop(); } catch (e) {}
         }
@@ -876,8 +1030,22 @@
       }
 
       toggleBtn.addEventListener("click", function () {
-        if (running) stopRecognition();
-        else startRecognition();
+        if (running) {
+          stopRecognition();
+        } else {
+          unlockSpeech();
+          startRecognition();
+        }
+      });
+
+      speakToggle.addEventListener("change", function () {
+        saveSpeakPref();
+        if (speakToggle.checked) {
+          unlockSpeech();
+        } else {
+          flushTts();
+          maybeResumeRecognition();
+        }
       });
 
       clearBtn.addEventListener("click", function () {
@@ -960,6 +1128,8 @@
         showError("当前浏览器不支持语音识别。请使用最新版 Chrome 或 Edge 打开本页面。");
         toggleBtn.disabled = true;
       }
+
+      loadSpeakPref();
 
       if (window.speechSynthesis) {
         window.speechSynthesis.getVoices();
